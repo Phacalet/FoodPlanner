@@ -1,0 +1,58 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function circle(cid) { return get(/databases/$(database)/documents/circles/$(cid)).data; }
+    function isMember(cid) { return signedIn() && request.auth.uid in circle(cid).memberIds; }
+    function isValidator(cid) { return signedIn() && circle(cid).get('validatorId', null) == request.auth.uid; }
+    function invitedTo(cid) {
+      return exists(/databases/$(database)/documents/invites/$(cid + '_' + request.auth.token.email))
+          || exists(/databases/$(database)/documents/invites/$(cid + '_' + request.auth.token.phone_number));
+    }
+
+    // Profil : chacun gère le sien.
+    match /users/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+    }
+
+    match /circles/{cid} {
+      allow read: if isMember(cid) || (signedIn() && invitedTo(cid));
+      allow create: if signedIn()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.memberIds == [request.auth.uid];
+      // Les membres modifient le cercle (votes, catalogue…) mais jamais validatorId,
+      // calculé par la Cloud Function à partir des votes.
+      allow update: if signedIn()
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['validatorId', 'createdBy'])
+        && (isMember(cid) || (invitedTo(cid)
+              && request.resource.data.memberIds.toSet()
+                   .difference(resource.data.memberIds.toSet()) == [request.auth.uid].toSet()));
+
+      // Fiches du jour
+      match /days/{dateKey} {
+        allow read: if isMember(cid);
+        allow create: if isMember(cid) && request.resource.data.get('locked', false) == false;
+        allow update: if isMember(cid) && (
+          // fiche ouverte : tout le monde modifie, mais seul le valideur verrouille
+          (resource.data.get('locked', false) == false
+             && (request.resource.data.get('locked', false) == false || isValidator(cid)))
+          // fiche verrouillée : seul le valideur peut la déverrouiller
+          || (resource.data.get('locked', false) == true && isValidator(cid))
+        );
+      }
+    }
+
+    match /invites/{id} {
+      // Les identifiants d'invitation sont non devinables en pratique ; lecture
+      // ouverte aux connectés pour simplifier la recherche par e-mail / téléphone.
+      allow read: if signedIn();
+      allow create: if isMember(request.resource.data.circleId)
+        && request.resource.data.invitedBy == request.auth.uid;
+      allow update: if signedIn() && (
+        resource.data.contact == request.auth.token.email
+        || resource.data.contact == request.auth.token.phone_number
+        || resource.data.invitedBy == request.auth.uid);
+    }
+  }
+}
